@@ -1,0 +1,374 @@
+---
+title: "RVPII_izveštaj"
+author: "Petar Trifunović"
+date: '2022-06-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "C:\\Users\\pekit\\Desktop\\Master - 1. semestar\\RVPII\\projekat\\podaci")
+```
+
+```{r eval=T, echo=F, results='hide', include=FALSE}
+Sys.setlocale("LC_CTYPE", ".1251")
+
+setwd("C:\\Users\\pekit\\Desktop\\Master - 1. semestar\\RVPII\\projekat\\podaci")
+
+library(sparklyr)
+library(dplyr)
+library(ggplot2)
+library(dbplot)
+library(knitr)
+
+
+sc <- spark_connect(master = "local", version="2.4.3")
+
+
+conf <- spark_config()
+conf["spark.executor.memory"] <- "5G"
+conf["sparklyr.shell.driver-memory"] <- "5G"
+
+```
+
+## Uvod
+
+Ovaj izveštaj pruža uvid u sve važne detalje toka analize dela demografskih podataka u saveznoj američkoj državi Pensilvaniji. Konkretno, radi se o podacima o broju smrti u Pensilvaniji, prikupljanim u rasponu od 1990. do 2017. godine. Izveštaj se sastoji od detaljnijeg opisa korišćenog skupa podataka, od pojedinosti vezanih za metode obrade podataka, kao i od pregleda dobijenih rezultata.
+
+## Izgled skupa podataka
+
+Korišćeni skup podataka moguće je naći na zvaničnom sajtu otvorenih podataka savezne države Pensilvanije, i to na adresi https://data.pa.gov/Health/Death-Dataset-Aggregated-at-the-State-County-Level/smxk-2cca/data. Svi podaci nalaze se u jednoj CSV datoteci. Svaka vrsta u tabeli podataka pruža informaciju o broju smrti koje su nastupile u određenom okrugu u Pensilvaniji u jednoj godini. Informacije o jednoj godini dodatno su podeljene na osnovu toga na koju etničku i starosnu grupu se odnose, na koji pol, a izvršena je i podela na osnovu uzroka smrti. Tako, svaka vrsta podataka sadrži sledeće atribute:
+
+* Year - godina na koju se podaci odnose,
+* Race__Ethnicity_Code - kod etničke grupe
+* Race__Ethnicity_Name - naziv etničke grupe; može biti "Hispanic", "White", "Black", "All Races"; kod etničke grupe se gradi na osnovu ovog polja tako što se izdvoji prvo slovo naziva grupe, osim u slučaju "All Races", kada je kod etničke grupe predstavljen slovom "T"
+* Gender_Code - kod pola
+* Gender_Name - naziv pola; može biti "Male", "Female" i "Total"; kod pola se gradi na osonvu ovog polja tako što se izdvoji prvo slovo iz naziva; vrednost "Total" odnosi se na nepoznat pol
+* Age_Group_Code - kod starosne grupe; svaka starosna grupa obuhvata raspon od pet godina, počev od 0 pa sve do 84, dok poslednja grupa predstavlja informacije o osobama starijih od 84 godine; ovo polje može uzeti vrednosti od 0 do 18, gde se 18 odnosi na grupu 85+, a 0 na podatke sa nepoznatom starosnom grupom
+* Age_Group_Name - tekstualno polje čija vrednost kazuje koji raspon godina je obuhvaćen
+* Cause_of_Death_Code - kod uzroka smrti; uzima vrednost od 1 do 100
+* Cause_of_Death_Name - tekstualno polje koje detaljnije opisuje uzrok smrti
+* County_FIPS_Code - kod okruga
+* County_Name - naziv okruga
+* Population - broj stanovnika na koji se odnosi dati red u tabeli podataka
+* Number_of_Deaths - broj smrti
+
+## Početne obrade podataka
+
+Pre početka same analize, bilo je neophodno učitati podatke pomoću *Apache Spark* alata, a zatim izvršiti uvodnu obradu podataka kako bi bili prilagođeni za dalji rad. Ovo uključuje izbacivanje suvišnih podataka, dodavanje novih obeležja, kao i izmene postojećih. Predstojeći isečak koda prikazuje sledeće:
+
+* učitavanje podataka iz CSV datoteke pomoću *Apache Spark* alata
+* prebacivanje polja *Population* iz celobrojnog u razlomljeni tip podataka
+* izbacivanje svih redova koje sadrže nepostojeće ili nepoznate vrednosti
+* izbacivanje svih redova koji kao kod etničke grupe imaju vrednost "T" (čija etnička grupa nije poznata)
+* izbacivanje svih redova koji kao kod starosne grupe imaju vrednost 0 (čija starosna grupa nije poznata)
+
+```{r eval=T, results='hold'}
+deaths.basic <- spark_read_csv(sc, 
+                               name = "deaths", 
+                               path = ".", 
+                               header = T, 
+                               memory = T)
+
+
+deaths <- deaths.basic %>% 
+  mutate(
+    Population = as.double(Population)
+  ) %>%
+  filter(!is.na(Year) & 
+    !is.na(Race__Ethnicity_Code) &
+      !is.na(Race__Ethnicity_Name) &
+      !is.na(Gender_Code) & 
+      !is.na(Gender_Name) & 
+      !is.na(Age_Group_Code) & 
+      !is.na(Age_Group_Name) & 
+      !is.na(Cause_of_Death_Code) & 
+      !is.na(Cause_of_Death_Name) &
+      !is.na(County_FIPS_Code) & 
+      !is.na(County_Name) & 
+      !is.na(Population) &
+      !is.na(Number_of_Deaths) &
+      Race__Ethnicity_Code != "T" &
+      Age_Group_Code != 0)
+
+
+```
+
+Nakon ovoga, izvršene su dodatne obrade zarad kreiranja određenog broja kategorijskih obeležja. Najvažnije od njih jeste obeležje *Age_Group_Descriptive* koje kazuje da li se određeni skup pojava svrstava u *Young* ili *Old* kategoriju, i koje će se kasnije koristiti prilikom klasifikacije. Sledeći isečak koda prikazuje kako su ova obeležja kreirana korišćenjem računanja kvantila:
+```{r eval=T, results='hold'}
+population <- deaths %>% 
+  select(Population) %>%
+  collect()
+
+num.deaths <- deaths %>%
+  select(Number_of_Deaths) %>%
+  collect()
+
+population.quantiles <- quantile(population$Population)
+population.low <- population.quantiles[[2]]
+population.high <- population.quantiles[[4]]
+
+
+num.deaths.quantiles <- quantile(
+  num.deaths$Number_of_Deaths,
+  probs = c(99.0, 99.1, 99.2, 99.3, 99.4, 99.5, 99.6, 99.7, 99.8, 99.9, 100)/100)
+num.deaths.low <- num.deaths.quantiles[[1]]
+num.deaths.high <- num.deaths.quantiles[[5]]
+
+
+deaths <- deaths %>% 
+  mutate(Age_Group_Descriptive = case_when(
+           Age_Group_Code < 9 ~ "Young",
+           TRUE ~ "Old"),
+         Population_Descriptive = case_when(
+           Population < population.low ~ "low",
+           Population < population.high ~ "mid",
+           TRUE ~ "high"),
+         Number_of_Deaths_Descriptive = case_when(
+           Number_of_Deaths < num.deaths.low ~ "low",
+           Number_of_Deaths < num.deaths.high ~ "mid",
+           TRUE ~ "high")
+        )
+
+```
+
+## Klasifikacija
+
+### Poređenje performansi klasifikacionih modela istog tipa
+
+U ovoj sekciji opisan je način na koji je izvršeno poređenje više različitih klasifikacionih modela istog tipa.
+
+#### Priprema podataka
+
+Pre sprovođenja klasifikacije, izvršene su neophodne pripreme podataka. Čitav skup podataka podeljen je na podskup za obučavanje (75% od čitavog skupa podataka) i podskup za validaciju (25% od čitavog skupa). Sledeći isečak koda ovo i pokazuje: 
+
+```{r eval=T, results='hold'}
+deaths.split <- sdf_random_split(deaths, training = 0.75, test = 0.25, seed = 5)
+
+deaths.training <- deaths.split$training
+deaths.test <- deaths.split$test
+```
+
+#### Sprovođenje klasifikacije metodom linearne regresije
+
+U svrhe klasifikacije korišćena je metoda linearne regresije. Cilj klasifikacije jeste odrediti vrednost obeležja *Age_Group_Descriptive* na osnovu podataka o kodovima pola, etničke grupe i uzroka smrti, kao i na osnovu naziva okruga na koji se podaci odnose. Linearna regresija je sprovođena za različite vrednosti parametra *max_iter* koji kazuje koliko će maksimalno iteracija biti izvršeno prilikom primene ove metode. Pojedinačne informacije o uspešnosti modela za svaku od korišćenih različitih vrednosti parametra *max_iter* čuvaju se kako bi kasnije mogle da se iskoriste za vizualizaciju rezultata. Sledeći isečak koda pokazuje kako je klasifikacija sprovedena:
+
+```{r eval=T, results='hold'}
+iters <- c(3, 5, 10, 15, 20, 30, 50)
+model.accuracies <- c(length(iters))
+counter <- 0
+
+for (iter in iters) {
+  counter <- counter + 1
+  log.reg <- ml_logistic_regression(
+    x = deaths.training, 
+    formula = Age_Group_Descriptive ~ 
+      Gender_Code + 
+      Race__Ethnicity_Code +
+      Population_Descriptive +
+      Cause_of_Death_Code +
+      County_Name, 
+    family = "binomial", max_iter = iter, threshold = 0.5)
+  
+  log.reg.perfs <- ml_evaluate(log.reg, deaths.test)
+  model.accuracies[counter] <- log.reg.perfs$accuracy()
+}
+```
+
+#### Vizualizacija rezultata klasifikacije 
+
+Rezultati klasifikacije mogu se videti na grafikonu ispod. Sa grafikona je uočljivo da postoji primetan porast kvaliteta rezultata pri promeni broja iteracija od 5 do 30. Nakon toga dolazi do zasićenja u pogledu preciznosti klasifikacionog modela, pa povećanje iteracija nema preveliki značaj.
+
+```{r echo=F}
+df <- data.frame(max_iterations = iters, accuracy = model.accuracies)
+df
+
+g <- ggplot(df, aes(max_iterations, accuracy)) +
+  geom_line() +
+  geom_point()
+
+g
+```
+
+
+### Poređenje performansi klasifikacionih modela različitog tipa
+
+U ovoj sekciji opisan je način na koji je izvršeno poređenje više različitih klasifikacionih modela različitog tipa. Za posmatranje performansi ovih modela, kao i njihovo upoređivanje, korišćena je k-tostruka unakrsna validacija, sa parametrom *k* postavljenim na vrednost 3.
+
+#### Priprema podataka
+
+Pre sprovođenja klasifikacije, definisan je parametar *k*, izvučena je u posebnu promenljivu formula koja će se prosleđivati svakom od modela, a na osnovu vrednosti parametra *k* izvršena je podela početnog skupa podataka u 3 podskupa od kojih će svaki pojedinačno biti korišćen kao validacioni, dok će ostali biti korišćeni za obučavanje.
+
+```{r eval=T, results='hold'}
+k <- 3
+model.formula <- Age_Group_Descriptive ~ 
+  Gender_Code + 
+  Race__Ethnicity_Code +
+  Population_Descriptive +
+  Cause_of_Death_Code +
+  County_Name
+
+accuracies.dec.tree <- c()
+accuracies.log.reg <- c()
+accuracies.svm <- c()
+
+partition_sizes <- rep(1/k, times = k)
+names(partition_sizes) <- paste0("fold", as.character(1:k))
+
+deaths.partitions <- deaths %>%
+  sdf_random_split(weights = partition_sizes, seed = 86)
+```
+
+#### Sprovođenje klasifikacije i beleženje rezultata
+
+Tri tipa klasifikacionih modela korišćeno je u ovom delu obrade. To su stablo odlučivanja, linearna regresija i metoda potpornih vektora. U *for* petlji su ovi modeli kreirani i testirani za svaki od 3 validaciona skupa, a beleženi su zasebno rezultati za svaki od njih.
+
+```{r eval=T, results='hold'}
+for (i in 1:k) {
+  
+  training <- sdf_bind_rows(deaths.partitions[-i])
+  
+  dec.tree <- ml_decision_tree_classifier(
+    x = training, 
+    formula = model.formula,
+    max_depth = 5, 
+    min_instances_per_node = 1000, 
+    impurity = "gini")
+  
+  log.reg <- ml_logistic_regression(
+    x = training, 
+    formula = model.formula, 
+    family = "binomial", 
+    max_iter = 20, 
+    threshold = 0.5)
+  
+  svm <- ml_linear_svc(
+    x = training,
+    formula = model.formula,
+    max_iter = 20, 
+    standardization = T)
+  
+  evaluate.dec.tree <- ml_evaluate(dec.tree, deaths.partitions[[i]])
+  accuracies.dec.tree[i] <- evaluate.dec.tree$Accuracy
+  
+  evaluate.log.reg <- ml_evaluate(log.reg, deaths.partitions[[i]])  
+  accuracies.log.reg[i] <- evaluate.log.reg$accuracy()
+  
+  evaluate.svm <- ml_evaluate(svm, deaths.partitions[[i]])
+  accuracies.svm[i] <- evaluate.svm$Accuracy
+  
+}
+```
+
+```{r echo=F}
+df <- data.frame(c(mean(accuracies.dec.tree), mean(accuracies.log.reg), mean(accuracies.svm)))
+colnames(df) <- c("Srednja vrednost preciznosti")
+rownames(df) <- c("Stablo odlučivanja", "Logistička regresija", "Metoda potpornih vektora")
+kable(df, caption="Rezultati k-tostruke unakrsne validacije")
+```
+
+U tabeli iznad prikazani su rezultati validacije, odnosno prosečne vrednosti preciznosti svakog od tri korišćena tipa modela.
+
+## Klasterizacija
+
+U ovoj sekciji biće opisan način na koji je sprovedena klasterziacija podataka. Biće dat pregled rezultata dobijenih nakon klasterizacije. Biće dat pregled dve klasterizacije, jedne izvršene pre agregacije podataka, i druge, izvršene nakon toga. Obe će prikazati kakav je odnos broja smrti koje su nastupile i starosne grupe na koju se taj broj odnosi.
+
+### Klasterizacije neagregiranih podataka
+
+#### Sprovođenje klasterizacije
+
+U nastavku se nalazi isečak koda koji prikazuje kako je izvršena klasterizacije neagregiranih podataka. Pre klasterizacije izvršeno je filtriranje podataka tako da su izbačeni podaci kod kojih je broj smrti veći od 5000, ili je jednak nuli. Za klasterizaciju je korišćena *k-means* metoda sa 3 centra. 
+
+```{r eval=T, results='hold'}
+deaths.for.clusters <- deaths %>% 
+  filter(Number_of_Deaths > 0 & 
+           Number_of_Deaths < 5000)
+
+deaths.per.age <- ml_kmeans(
+  deaths.for.clusters,
+  ~ Age_Group_Code + Number_of_Deaths, 
+  k = 3, 
+  max_iter = 10, 
+  init_mode = "k-means||")
+
+cluster.values <- deaths.per.age$model$summary$cluster() %>% collect()
+deaths.for.clusters <- deaths.for.clusters %>% collect()
+deaths.for.clusters$clust <- as.factor(cluster.values$prediction)
+
+cluster.centers.df <- data.frame(
+  age = deaths.per.age$centers$Age_Group_Code,
+  num_deaths = deaths.per.age$centers$Number_of_Deaths
+)
+
+```
+
+#### Vizualizacija dobijenih klastera
+
+Na grafikonu ispod nalazi se prikaz dobijenih klastera sa svojim centrima. Može se uočiti da klasterizacija ne daje najsavršenije rezultate, ali se naslućuje trend porasta broja umrlih sa povećanjem koda starosne grupe, odnosno sa povećanjem godina života.
+
+```{r echo=F}
+ggplot(data = deaths.for.clusters,
+       aes(x = Age_Group_Code, y = Number_of_Deaths, colour = clust)) +
+  geom_jitter(size = 2) +
+  geom_point(data = cluster.centers.df,
+           aes(x = age, y = num_deaths),
+           color = "brown",
+           size = 4,
+           shape = 15)
+```
+
+
+### Klasterizacije agregiranih podataka
+
+#### Sprovođenje klasterizacije
+
+Drugi pokušaj klasterizacije pre sprovođenja iste grupiše podatke po određenim obeležjima. Naime, pretpostavka je da je broj umrlih iz pojedinih starosnih grupa raštrkan po etničkoj pripadnosti, polu, uzroku smrti i okrugu. Zbog toga je upravo po ovim vrednostima, kao i po kodu starosne grupe, izvršena agregacija pre klasterizacije, kao što se može videti u delu koda koji sledi:
+
+```{r eval=T, results='hold'}
+deaths.for.clusters2 <- deaths %>% 
+  filter(Number_of_Deaths > 0 & 
+           Number_of_Deaths < 5000) %>%
+  group_by(Race__Ethnicity_Code,
+           Gender_Code,
+           Cause_of_Death_Code,
+           County_Name,
+           Age_Group_Code) %>%
+  summarise(Deaths_Sum=sum(Number_of_Deaths), .groups = "keep")
+
+deaths.per.age2 <- deaths.for.clusters2 %>% 
+  ml_kmeans(~ Age_Group_Code + Deaths_Sum, 
+            k = 3, 
+            max_iter = 10, 
+            init_mode = "k-means||")
+
+cluster.values2 <- deaths.per.age2$model$summary$cluster() %>% collect()
+deaths.for.clusters2 <- deaths.for.clusters2 %>% collect()
+deaths.for.clusters2$clust <- as.factor(cluster.values2$prediction)
+
+cluster.centers.df2 <- data.frame(
+  age = deaths.per.age2$centers$Age_Group_Code,
+  num_deaths = deaths.per.age2$centers$Deaths_Sum
+)
+
+```
+
+
+#### Vizualizacija dobijenih klastera
+
+Na grafikonu ispod nalazi se prikaz dobijenih klastera sa svojim centrima. Iako pretpostavka opisana u prethodnom pasusu, koja je dovela do ideje o agregaciji, zvuči smisleno, na grafikonu se ne primećuje znatan napredak u odnosu na rezultate klasterizacije dobijene korišćenjem neagregiranih podataka.
+
+```{r echo=F}
+ggplot(data = deaths.for.clusters2,
+       aes(x = Age_Group_Code, y = Deaths_Sum, colour = clust)) +
+  geom_jitter(size = 2) +
+  geom_point(data = cluster.centers.df2,
+             aes(x = age, y = num_deaths),
+             color = "brown",
+             size = 4,
+             shape = 15)
+```
+
+
+## Zaključak
+
+Ovaj rad demonstrira način na koji je moguće izvući znanje iz jednog velikog skupa podataka. Pokazuje kako pretpostavke postojanja pravilnosti u podacima koje deluju očigledno ne moraju nužno da budu tačne. Takođe, u radu je prikazano kako različite vrednosti pojedinih parametara mogu osetno da utiču na obradu, kao i na njene rezultate.
